@@ -1,2 +1,8 @@
-
-exit
+venv/
+__pycache__/
+*.pyc
+*.pth
+*.pt
+*.ckpt
+*.mkv
+*.mp4
