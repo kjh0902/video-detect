@@ -1,20 +1,18 @@
-#!/usr/bin/python
-#-*- coding: utf-8 -*-
-# Video 25 FPS, Audio 16000HZ
+import os
+import glob
+import math
+import shutil
+import subprocess
+import time
 
-import torch
-import numpy
-import time, pdb, argparse, subprocess, os, math, glob
 import cv2
-import python_speech_features
+import numpy as np
+import torch
 
-from scipy import signal
 from scipy.io import wavfile
+from scipy import signal
+import python_speech_features
 from SyncNetModel import *
-from shutil import rmtree
-
-
-# ==================== Get OFFSET ====================
 
 def calc_pdist(feat1, feat2, vshift=10):
     
@@ -30,217 +28,185 @@ def calc_pdist(feat1, feat2, vshift=10):
 
     return dists
 
-# ==================== MAIN DEF ====================
-
 class SyncNetInstance(torch.nn.Module):
+    def __init__(self, dropout=0, num_layers_in_fc_layers=1024, device="cpu"):
+        super().__init__()
+        self.device = torch.device("cpu")
+        self.__S__ = S(num_layers_in_fc_layers=num_layers_in_fc_layers).to(self.device)
+        self.__S__.eval()
 
-    def __init__(self, dropout = 0, num_layers_in_fc_layers = 1024):
-        super(SyncNetInstance, self).__init__();
+    def _prepare_tmp_dir(self, opt):
+        work_dir = os.path.join(opt.tmp_dir, opt.reference)
+        if os.path.exists(work_dir):
+            shutil.rmtree(work_dir)
+        os.makedirs(work_dir, exist_ok=True)
+        return work_dir
 
-        self.__S__ = S(num_layers_in_fc_layers = num_layers_in_fc_layers).cuda();
-
-    def evaluate(self, opt, videofile):
-
-        self.__S__.eval();
-
-        # ========== ==========
-        # Convert files
-        # ========== ==========
-
-        if os.path.exists(os.path.join(opt.tmp_dir,opt.reference)):
-          rmtree(os.path.join(opt.tmp_dir,opt.reference))
-
-        os.makedirs(os.path.join(opt.tmp_dir,opt.reference))
-
-        # command = ("ffmpeg -y -i %s -threads 1 -f image2 %s" % (videofile,os.path.join(opt.tmp_dir,opt.reference,'%06d.jpg'))) 
-        command = (
-            "ffmpeg -y -i %s -threads 1 "
-            "-vf fps=25 -vsync 0 -q:v 2 -f image2 %s"
-            % (videofile, os.path.join(opt.tmp_dir,opt.reference,'%06d.jpg'))
+    def _ffmpeg_extract_frames(self, videofile, out_pattern):
+        cmd = (
+            f'ffmpeg -y -i "{videofile}" -threads 1 '
+            f'-vf fps=25 -vsync 0 -q:v 2 -f image2 "{out_pattern}"'
         )
-        subprocess.call(command, shell=True, stdout=None)        
-        
-        
-        output = subprocess.call(command, shell=True, stdout=None)
+        subprocess.check_call(cmd, shell=True)
 
-        # command = ("ffmpeg -y -i %s -async 1 -ac 1 -vn -acodec pcm_s16le -ar 16000 %s" % (videofile,os.path.join(opt.tmp_dir,opt.reference,'audio.wav')))   
-        audio_raw = os.path.join(opt.tmp_dir,opt.reference,'audio_raw.wav')
-        command = (
-            "ffmpeg -y -i %s -vn -ac 1 -ar 16000 -acodec pcm_s16le %s"
-            % (videofile, audio_raw)
+    def _ffmpeg_extract_audio(self, videofile, out_wav):
+        cmd = (
+            f'ffmpeg -y -i "{videofile}" -vn -ac 1 -ar 16000 -acodec pcm_s16le "{out_wav}"'
         )
-        subprocess.call(command, shell=True, stdout=None)        
-        
-        output = subprocess.call(command, shell=True, stdout=None)
-        
-        # ========== ==========
-        # Load video 
-        # ========== ==========
+        subprocess.check_call(cmd, shell=True)
 
+    def _load_frames_as_tensor(self, frame_files):
         images = []
-        
-        flist = glob.glob(os.path.join(opt.tmp_dir,opt.reference,'*.jpg'))
-        flist.sort()
+        for fname in frame_files:
+            img = cv2.imread(fname)
+            if img is None:
+                continue
+            images.append(img)
 
-        for fname in flist:
-            images.append(cv2.imread(fname))
+        if len(images) < 5:
+            return None, 0  
 
-        im = numpy.stack(images,axis=3)
-        im = numpy.expand_dims(im,axis=0)
-        im = numpy.transpose(im,(0,3,4,1,2))
+        im = np.stack(images, axis=0)  
+        im = np.transpose(im, (3, 0, 1, 2))  
+        im = np.expand_dims(im, axis=0)  
+        imtv = torch.from_numpy(im.astype(np.float32)) 
 
-        imtv = torch.autograd.Variable(torch.from_numpy(im.astype(float)).float())
+        return imtv, len(images)
 
-        # ========== ==========
-        # Load audio
-        # ========== ==========
-        images = []
-        flist = glob.glob(os.path.join(opt.tmp_dir,opt.reference,'*.jpg'))
-        flist.sort()
-        for fname in flist:
-            images.append(cv2.imread(fname))
+    def _load_audio_as_tensor(self, audio_wav_path, num_frames, fps=25, sr=16000):
+        sample_rate, audio = wavfile.read(audio_wav_path)
 
-        # Load audio (raw) then force-match to video length
-        sample_rate, audio = wavfile.read(audio_raw)
-
-        # 목표 길이(초) = len(images)/25, 목표 샘플 = 목표초 * 16000
-        target_sec = float(len(images)) / 25.0
-        target_samples = int(round(target_sec * 16000))
-
-        # audio는 int16이어야 python_speech_features에서 안정적
         if audio.ndim > 1:
             audio = audio[:, 0]
-        audio = audio.astype(numpy.int16, copy=False)
+        audio = audio.astype(np.int16, copy=False)
+
+        target_sec = float(num_frames) / float(fps)
+        target_samples = int(round(target_sec * sr))
 
         if len(audio) < target_samples:
-            pad = numpy.zeros((target_samples - len(audio),), dtype=numpy.int16)
-            audio = numpy.concatenate([audio, pad], axis=0)
+            pad = np.zeros((target_samples - len(audio),), dtype=np.int16)
+            audio = np.concatenate([audio, pad], axis=0)
         elif len(audio) > target_samples:
             audio = audio[:target_samples]
 
-        # 이제 여기서 mfcc
-        mfcc = zip(*python_speech_features.mfcc(audio, 16000))
-        mfcc = numpy.stack([numpy.array(i) for i in mfcc])
+        mfcc = python_speech_features.mfcc(audio, sr)
+        mfcc = np.stack(list(zip(*mfcc)), axis=0)  
 
-        cc = numpy.expand_dims(numpy.expand_dims(mfcc,axis=0),axis=0)
-        cct = torch.autograd.Variable(torch.from_numpy(cc.astype(float)).float())
+        cc = np.expand_dims(np.expand_dims(mfcc.astype(np.float32), axis=0), axis=0)
+        cct = torch.from_numpy(cc)
 
-        # ========== ==========
-        # Check audio and video input length
-        # ========== ==========
+        return audio, cct
 
-        if (float(len(audio))/16000) != (float(len(images))/25) :
-            print("WARNING: Audio (%.4fs) and video (%.4fs) lengths are different."%(float(len(audio))/16000,float(len(images))/25))
+    def evaluate(self, opt, videofile):
+        self.__S__.eval()
 
-        min_length = min(len(images),math.floor(len(audio)/640))
-        
-        # ========== ==========
-        # Generate video and audio feats
-        # ========== ==========
+        work_dir = self._prepare_tmp_dir(opt)
+        frame_pattern = os.path.join(work_dir, "%06d.jpg")
+        audio_wav = os.path.join(work_dir, "audio_raw.wav")
 
-        lastframe = min_length-5
+        self._ffmpeg_extract_frames(videofile, frame_pattern)
+        self._ffmpeg_extract_audio(videofile, audio_wav)
+
+        flist = sorted(glob.glob(os.path.join(work_dir, "*.jpg")))
+        imtv, num_frames = self._load_frames_as_tensor(flist)
+        if imtv is None:
+            raise RuntimeError("Not enough frames extracted for SyncNet (need at least 5 frames).")
+
+        audio, cct = self._load_audio_as_tensor(audio_wav, num_frames, fps=25, sr=16000)
+
+        vid_sec = float(num_frames) / 25.0
+        aud_sec = float(len(audio)) / 16000.0
+        if abs(aud_sec - vid_sec) > 1e-3:
+            print(f"WARNING: Audio ({aud_sec:.4f}s) and video ({vid_sec:.4f}s) lengths differ.")
+
+        min_length = min(num_frames, math.floor(len(audio) / 640))
+        lastframe = min_length - 5
+        if lastframe <= 0:
+            raise RuntimeError("Clip too short after alignment. Need longer video/audio.")
+
         im_feat = []
         cc_feat = []
 
         tS = time.time()
-        for i in range(0,lastframe,opt.batch_size):
-            
-            im_batch = [ imtv[:,:,vframe:vframe+5,:,:] for vframe in range(i,min(lastframe,i+opt.batch_size)) ]
-            im_in = torch.cat(im_batch,0)
-            im_out  = self.__S__.forward_lip(im_in.cuda());
-            im_feat.append(im_out.data.cpu())
+        with torch.no_grad():
+            for i in range(0, lastframe, opt.batch_size):
+                end = min(lastframe, i + opt.batch_size)
 
-            cc_batch = [ cct[:,:,:,vframe*4:vframe*4+20] for vframe in range(i,min(lastframe,i+opt.batch_size)) ]
-            cc_in = torch.cat(cc_batch,0)
-            cc_out  = self.__S__.forward_aud(cc_in.cuda())
-            cc_feat.append(cc_out.data.cpu())
+                im_batch = [imtv[:, :, vframe:vframe + 5, :, :] for vframe in range(i, end)]
+                im_in = torch.cat(im_batch, dim=0).to(self.device)
+                im_out = self.__S__.forward_lip(im_in)
+                im_feat.append(im_out.cpu())
 
-        im_feat = torch.cat(im_feat,0)
-        cc_feat = torch.cat(cc_feat,0)
+                cc_batch = [cct[:, :, :, vframe * 4:vframe * 4 + 20] for vframe in range(i, end)]
+                cc_in = torch.cat(cc_batch, dim=0).to(self.device)
+                cc_out = self.__S__.forward_aud(cc_in)
+                cc_feat.append(cc_out.cpu())
 
-        # ========== ==========
-        # Compute offset
-        # ========== ==========
-            
-        print('Compute time %.3f sec.' % (time.time()-tS))
+        im_feat = torch.cat(im_feat, dim=0)
+        cc_feat = torch.cat(cc_feat, dim=0)
 
-        dists = calc_pdist(im_feat,cc_feat,vshift=opt.vshift)
-        mdist = torch.mean(torch.stack(dists,1),1)
+        print("Compute time %.3f sec." % (time.time() - tS))
 
-        minval, minidx = torch.min(mdist,0)
+        dists = calc_pdist(im_feat, cc_feat, vshift=opt.vshift)
+        mdist = torch.mean(torch.stack(dists, dim=1), dim=1)
 
-        offset = opt.vshift-minidx
-        conf   = torch.median(mdist) - minval
+        minval, minidx = torch.min(mdist, dim=0)
 
-        fdist   = numpy.stack([dist[minidx].numpy() for dist in dists])
-        # fdist   = numpy.pad(fdist, (3,3), 'constant', constant_values=15)
-        fconf   = torch.median(mdist).numpy() - fdist
-        fconfm  = signal.medfilt(fconf,kernel_size=9)
-        
-        numpy.set_printoptions(formatter={'float': '{: 0.3f}'.format})
-        print('Framewise conf: ')
+        offset = opt.vshift - int(minidx.item())
+        conf = float((torch.median(mdist) - minval).item())
+
+        fdist = np.stack([dist[minidx].numpy() for dist in dists])
+        fconf = float(torch.median(mdist).item()) - fdist
+        fconfm = signal.medfilt(fconf, kernel_size=9)
+
+        np.set_printoptions(formatter={"float": "{: 0.3f}".format})
+        print("Framewise conf: ")
         print(fconfm)
-        print('AV offset: \t%d \nMin dist: \t%.3f\nConfidence: \t%.3f' % (offset,minval,conf))
+        print("AV offset:\t%d\nMin dist:\t%.3f\nConfidence:\t%.3f" % (offset, float(minval.item()), conf))
 
-        dists_npy = numpy.array([ dist.numpy() for dist in dists ])
-        return offset.numpy(), conf.numpy(), dists_npy
+        dists_npy = np.array([dist.numpy() for dist in dists])
+        return offset, conf, dists_npy
 
     def extract_feature(self, opt, videofile):
+        self.__S__.eval()
 
-        self.__S__.eval();
-        
-        # ========== ==========
-        # Load video 
-        # ========== ==========
         cap = cv2.VideoCapture(videofile)
-
-        frame_num = 1;
         images = []
-        while frame_num:
-            frame_num += 1
+        while True:
             ret, image = cap.read()
-            if ret == 0:
+            if not ret:
                 break
-
             images.append(image)
+        cap.release()
 
-        im = numpy.stack(images,axis=3)
-        im = numpy.expand_dims(im,axis=0)
-        im = numpy.transpose(im,(0,3,4,1,2))
+        if len(images) < 5:
+            raise RuntimeError("Not enough frames to extract lip features (need at least 5 frames).")
 
-        imtv = torch.autograd.Variable(torch.from_numpy(im.astype(float)).float())
-        
-        # ========== ==========
-        # Generate video feats
-        # ========== ==========
+        im = np.stack(images, axis=0)  
+        im = np.transpose(im, (3, 0, 1, 2))  
+        im = np.expand_dims(im, axis=0)  
+        imtv = torch.from_numpy(im.astype(np.float32))
 
-        lastframe = len(images)-4
+        lastframe = len(images) - 4
         im_feat = []
 
         tS = time.time()
-        for i in range(0,lastframe,opt.batch_size):
-            
-            im_batch = [ imtv[:,:,vframe:vframe+5,:,:] for vframe in range(i,min(lastframe,i+opt.batch_size)) ]
-            im_in = torch.cat(im_batch,0)
-            im_out  = self.__S__.forward_lipfeat(im_in.cuda());
-            im_feat.append(im_out.data.cpu())
+        with torch.no_grad():
+            for i in range(0, lastframe, opt.batch_size):
+                end = min(lastframe, i + opt.batch_size)
+                im_batch = [imtv[:, :, vframe:vframe + 5, :, :] for vframe in range(i, end)]
+                im_in = torch.cat(im_batch, dim=0).to(self.device)
+                im_out = self.__S__.forward_lipfeat(im_in)
+                im_feat.append(im_out.cpu())
 
-        im_feat = torch.cat(im_feat,0)
-
-        # ========== ==========
-        # Compute offset
-        # ========== ==========
-            
-        print('Compute time %.3f sec.' % (time.time()-tS))
-
+        im_feat = torch.cat(im_feat, dim=0)
+        print("Compute time %.3f sec." % (time.time() - tS))
         return im_feat
 
-
     def loadParameters(self, path):
-        loaded_state = torch.load(path, map_location=lambda storage, loc: storage);
+        loaded_state = torch.load(path, map_location="cpu")
 
-        self_state = self.__S__.state_dict();
-
+        self_state = self.__S__.state_dict()
         for name, param in loaded_state.items():
-
-            self_state[name].copy_(param);
+            if name in self_state:
+                self_state[name].copy_(param)
