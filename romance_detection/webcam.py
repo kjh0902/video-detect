@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import threading
+from enum import Enum, auto
 from dataclasses import dataclass
 from collections import deque
 from pathlib import Path
@@ -17,6 +18,7 @@ import torch
 import mediapipe as mp
 import python_speech_features
 
+from greenlight_ui import draw_greenlight_ui
 from detector import DeepfakeDetector, DetectorConfig
 from preprocess import FaceCropConfig, crop_face_from_bbox
 
@@ -147,7 +149,7 @@ def clamp_bbox(x1, y1, x2, y2, w, h):
     if y2 <= y1: y2 = min(h - 1, y1 + 1)
     return x1, y1, x2, y2
 
-
+'''
 def mouth_crop_from_landmarks(frame_bgr: np.ndarray, landmarks, out_size: int = 224, margin: float = 0.35):
     h, w = frame_bgr.shape[:2]
     xs = []
@@ -172,6 +174,74 @@ def mouth_crop_from_landmarks(frame_bgr: np.ndarray, landmarks, out_size: int = 
 
     nx1, ny1, nx2, ny2 = clamp_bbox(nx1, ny1, nx2, ny2, w, h)
     crop = frame_bgr[ny1:ny2, nx1:nx2]
+    crop = cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
+    return crop
+'''
+
+def mouth_crop_from_landmarks(
+    frame_bgr: np.ndarray,
+    landmarks,
+    out_size: int = 224,
+    margin: float = 0.35,
+) -> Optional[np.ndarray]:
+    h, w = frame_bgr.shape[:2]
+    if h <= 1 or w <= 1:
+        return None
+
+    # LIPS_OUTER 인덱스가 유효한지 방어
+    if landmarks is None or len(landmarks) <= max(LIPS_OUTER):
+        return None
+
+    xs, ys = [], []
+    for idx in LIPS_OUTER:
+        x = float(landmarks[idx].x) * w
+        y = float(landmarks[idx].y) * h
+        if not np.isfinite(x) or not np.isfinite(y):
+            return None
+        xs.append(x)
+        ys.append(y)
+
+    x1, y1 = min(xs), min(ys)
+    x2, y2 = max(xs), max(ys)
+
+    bw = (x2 - x1)
+    bh = (y2 - y1)
+
+    # 입 박스가 너무 작거나(추적 불안정), 역전되면 스킵
+    if bw < 2 or bh < 2:
+        return None
+
+    cx = 0.5 * (x1 + x2)
+    cy = 0.5 * (y1 + y2)
+
+    # margin으로 정사각 확대
+    size = max(bw, bh) * (1.0 + margin)
+    if not np.isfinite(size) or size < 2:
+        return None
+
+    nx1 = int(round(cx - size / 2))
+    ny1 = int(round(cy - size / 2))
+    nx2 = int(round(cx + size / 2))
+    ny2 = int(round(cy + size / 2))
+
+    # frame 범위로 clamp
+    nx1 = max(0, min(w, nx1))
+    ny1 = max(0, min(h, ny1))
+    nx2 = max(0, min(w, nx2))
+    ny2 = max(0, min(h, ny2))
+
+    # 최종적으로 유효한 crop인지 체크
+    if nx2 - nx1 < 2 or ny2 - ny1 < 2:
+        return None
+
+    crop = frame_bgr[ny1:ny2, nx1:nx2]
+    if crop is None or crop.size == 0:
+        return None
+
+    # 혹시 단일 채널/이상 shape 방어
+    if crop.ndim != 3 or crop.shape[0] < 2 or crop.shape[1] < 2:
+        return None
+
     crop = cv2.resize(crop, (out_size, out_size), interpolation=cv2.INTER_LINEAR)
     return crop
 
@@ -302,35 +372,12 @@ class RealTimeSyncNet:
         mdist = torch.mean(torch.stack(dists, dim=1), dim=1)
 
         minval, minidx = torch.min(mdist, dim=0)
-        # print("minidx", int(minidx), "len", int(mdist.numel()), "vshift", self.cfg.vshift)
         offset_frames = int(self.cfg.vshift - int(minidx))
         conf = float(torch.median(mdist) - minval)
 
         offset_ms = float(offset_frames) * (1000.0 / float(fps))
         return offset_ms, conf
 
-# 화면 표시
-def draw_dashboard(frame, final_risk, unsync_prob, blink_count, fps, av_offset_ms, av_conf):
-    cv2.rectangle(frame, (10, 10), (470, 215), (0, 0, 0), -1)
-
-    color = (0, 255, 0) if final_risk < 0.5 else (0, 0, 255)
-    status = "REAL" if final_risk < 0.5 else "FAKE WARNING"
-    cv2.putText(frame, f"AI Analysis: {status}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-
-    cv2.rectangle(frame, (20, 50), (320, 70), (50, 50, 50), -1)
-    fill_width = int(300 * max(0.0, min(1.0, final_risk)))
-    cv2.rectangle(frame, (20, 50), (20 + fill_width, 70), color, -1)
-    cv2.putText(frame, f"{final_risk * 100:.1f}%", (20 + min(fill_width, 280) + 5, 65),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-    cv2.putText(frame, f"Blinks: {blink_count}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
-    cv2.putText(frame, f"FPS: {fps:.1f}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-
-    if av_offset_ms is None or av_conf is None:
-        cv2.putText(frame, "AV Sync: ...", (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    else:
-        cv2.putText(frame, f"AV Sync: {unsync_prob * 100:.1f}%", (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
-    
 
 def generate_artifact_map(face_bgr):
     try:
@@ -346,17 +393,40 @@ def generate_artifact_map(face_bgr):
     except Exception:
         return face_bgr
 
+
 def main():
+    # Dev toggles (useful on macOS where PortAudio / ffmpeg setup may block progress)
+    #   GREENLIGHT_NO_AUDIO=1  -> disable microphone capture (skips PortAudio)
+    #   GREENLIGHT_NO_SYNC=1   -> disable SyncNet
+    ENABLE_AUDIO = os.getenv("GREENLIGHT_NO_AUDIO", "0") != "1"
+    ENABLE_SYNC = os.getenv("GREENLIGHT_NO_SYNC", "0") != "1"
+
+    class RiskState(Enum):
+        GREEN = auto()
+        YELLOW = auto()
+        RED = auto()
+
+    def risk_to_state(r: float) -> RiskState:
+        if r < 0.3:
+            return RiskState.GREEN
+        if r < 0.7:
+            return RiskState.YELLOW
+        return RiskState.RED
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("웹캠을 열 수 없음")
         return
 
-    # audio
-    mic = MicStream(sr=16000, blocksize=1024, device=None)
-    mic.start()
+    # audio (optional)
+    mic = None
+    if ENABLE_AUDIO:
+        mic = MicStream(sr=16000, blocksize=1024, device=None)
+        mic.start()
+    else:
+        print("[DEV] Audio disabled (GREENLIGHT_NO_AUDIO=1)")
 
-    # syncnet 
+    # syncnet (optional)
     sync_cfg = SyncCfg(
         initial_model=str((SYNCNET_REPO / "data" / "syncnet_v2.model").resolve()),
         fps=25,
@@ -366,8 +436,15 @@ def main():
         vshift=50,
         device="cpu",
     )
-    rt_sync = RealTimeSyncNet(sync_cfg)
-    print("SyncNet device: cpu")
+
+    rt_sync = None
+    if ENABLE_SYNC and ENABLE_AUDIO:
+        rt_sync = RealTimeSyncNet(sync_cfg)
+        print("SyncNet device: cpu")
+    elif not ENABLE_SYNC:
+        print("[DEV] SyncNet disabled (GREENLIGHT_NO_SYNC=1)")
+    elif ENABLE_SYNC and not ENABLE_AUDIO:
+        print("[DEV] SyncNet requires audio. SyncNet disabled because audio is disabled.")
 
     cap_frames = int(round(30.0 * sync_cfg.clip_sec))  # 60
     mouth_buf = deque(maxlen=cap_frames)
@@ -406,6 +483,49 @@ def main():
                 sync_running = False
 
     prev_time = time.time()
+
+    # UI/behavior state machine
+    state: RiskState = RiskState.GREEN
+    yellow_report_shown = False
+    red_enter_time: Optional[float] = None
+    red_continue_granted = False
+    RED_COUNTDOWN_SEC = 5.0
+
+    def render_report_image(
+        risk_state: RiskState,
+        final_risk: float,
+        fake_prob: float,
+        unsync_prob: float,
+        av_offset_ms: Optional[float],
+        av_conf: Optional[float],
+    ) -> np.ndarray:
+        """Simple CV report window (fast MVP)."""
+        img = np.zeros((340, 640, 3), dtype=np.uint8)
+        title = "RISK REPORT"
+        cv2.putText(img, title, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+        if risk_state == RiskState.GREEN:
+            badge = "GREEN / SAFE"
+            badge_color = (0, 255, 0)
+        elif risk_state == RiskState.YELLOW:
+            badge = "YELLOW / CAUTION"
+            badge_color = (0, 255, 255)
+        else:
+            badge = "RED / DANGER"
+            badge_color = (0, 0, 255)
+
+        cv2.putText(img, badge, (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.9, badge_color, 2)
+        cv2.putText(img, f"Final risk: {final_risk:.3f}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 2)
+        cv2.putText(img, f"Deepfake prob: {fake_prob:.3f}", (20, 170), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 2)
+        cv2.putText(img, f"Unsync prob: {unsync_prob:.3f}", (20, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 2)
+
+        if av_offset_ms is None or av_conf is None:
+            cv2.putText(img, "AV Sync: n/a", (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (180, 180, 180), 2)
+        else:
+            cv2.putText(img, f"AV offset (ms): {av_offset_ms:.1f}", (20, 250), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 2)
+            cv2.putText(img, f"AV confidence: {av_conf:.2f}", (20, 290), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (230, 230, 230), 2)
+
+        return img
 
     try:
         while cap.isOpened():
@@ -470,7 +590,6 @@ def main():
                         if av_offset_ms is not None and av_conf is not None:
                             unsync_prob = sync_risk(av_offset_ms, av_conf)
                             final_risk = clamp01(w_df * fake_prob + w_sync * unsync_prob)
-                            # print(f"offset_ms={av_offset_ms:.1f}ms (signed), off={abs(av_offset_ms):.1f}ms, conf={av_conf:.2f}")
                         else:
                             final_risk = fake_prob
 
@@ -510,7 +629,7 @@ def main():
             with sync_lock:
                 can_start = (not sync_running)
 
-            if (now - last_sync_time) >= SYNC_INTERVAL_SEC and len(mouth_buf) == mouth_buf.maxlen and can_start:
+            if rt_sync is not None and mic is not None and (now - last_sync_time) >= SYNC_INTERVAL_SEC and len(mouth_buf) == mouth_buf.maxlen and can_start:
                 last_sync_time = now
 
                 audio3 = mic.last(sync_cfg.clip_sec + DELAY_SEC)
@@ -530,16 +649,64 @@ def main():
             fps = 1.0 / max(1e-6, (curr_time - prev_time))
             prev_time = curr_time
 
-            draw_dashboard(frame, final_risk, unsync_prob, blink_count, fps, av_offset_ms, av_conf)
+            # --- State machine (GREEN / YELLOW / RED) ---
+            new_state = risk_to_state(final_risk)
+            if new_state != state:
+                state = new_state
+                if state == RiskState.YELLOW:
+                    yellow_report_shown = False
+                if state == RiskState.RED:
+                    red_enter_time = time.time()
+                    red_continue_granted = False
 
+            overlay_lines: List[str] = []
+
+            if state == RiskState.GREEN:
+                pass
+
+            elif state == RiskState.YELLOW:
+                overlay_lines.append("CAUTION: You are at a warning level.")
+                overlay_lines.append("Report is shown. Decide whether to continue.")
+                overlay_lines.append("(Press 'q' to quit)")
+                report = render_report_image(state, final_risk, fake_prob, unsync_prob, av_offset_ms, av_conf)
+                cv2.imshow("Risk Report", report)
+
+            else:  # RED
+                remain = None
+                if red_enter_time is not None:
+                    remain = RED_COUNTDOWN_SEC - (time.time() - red_enter_time)
+
+                overlay_lines.append("DANGER: High risk detected.")
+                if not red_continue_granted:
+                    overlay_lines.append("This call will close automatically.")
+                    overlay_lines.append("Press 'c' within 5 seconds to continue.")
+                    if remain is not None:
+                        overlay_lines.append(f"Auto-close in: {max(0.0, remain):.1f}s")
+                else:
+                    overlay_lines.append("You chose to continue (override).")
+                    overlay_lines.append("Report explains why this is risky.")
+
+                report = render_report_image(state, final_risk, fake_prob, unsync_prob, av_offset_ms, av_conf)
+                cv2.imshow("Risk Report", report)
+
+                if (not red_continue_granted) and (remain is not None) and (remain <= 0):
+                    print("[RED] Auto-terminating webcam.")
+                    break
+
+            draw_greenlight_ui(frame, final_risk, fps, blink_count, overlay_lines=overlay_lines)
             cv2.imshow("DeepTrust Hybrid System", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break      
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                break
+            if state == RiskState.RED and key == ord("c"):
+                red_continue_granted = True
 
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        mic.stop()
+        if mic is not None:
+            mic.stop()
 
 
 if __name__ == "__main__":
